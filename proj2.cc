@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <arpa/inet.h>
+#include "ip.h" // TODO fix path when submitting to class server
 
 #define ARG_PACKET_PRINT  0x1
 #define ARG_FWD_TABLE_PRINT   0x2
@@ -11,16 +12,36 @@
 #define ARG_FWD_FILE 0x8
 #define ARG_TRACE_FILE  0x10
 #define FWD_TABLE_ENTRY_SZ 8
+#define PACKET_SZ 28
+#define CHECKSUM_VALID 1234
 
 unsigned short cmd_line_flags = 0;
 char *fwd_file = NULL;
 char *trace_file = NULL;
 
-struct ForwardingTableEntry {
+struct fwd_table_entry {
     uint32_t ip;
     uint16_t prefix_len;
     uint16_t interface;
 };
+
+struct timev {
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+};
+
+struct packet {
+    timev timestamp;
+    iphdr ip_header;
+};
+
+void to_quad(uint32_t ip, uint8_t* quads) {
+    quads[0] = (ip >> 24) & 0xFF;
+    quads[1] = (ip >> 16) & 0xFF;
+    quads[2] = (ip >> 8) & 0xFF;
+    quads[3] = ip & 0xFF;
+}
+
 
 void usage (char *progname)
 {
@@ -72,8 +93,37 @@ void parseargs (int argc, char *argv [])
 }
 
 void printPacket(char *trace_file) {
-    std::cout << "Printing packets from trace file: " << trace_file << std::endl;
-    // Implementation of packet printing goes here
+    packet packet;
+    FILE * file = fopen(trace_file, "rb");
+
+    if (file == nullptr) {
+        fprintf(stderr, "Error: could not open file %s \n", trace_file);
+        exit(1);
+    }
+    while (fread(&packet, PACKET_SZ, 1, file) == 1) {
+        // Convert to host byte order
+        packet.timestamp.tv_sec = ntohl(packet.timestamp.tv_sec);
+        packet.timestamp.tv_usec = ntohl(packet.timestamp.tv_usec);
+        packet.ip_header.saddr = ntohl(packet.ip_header.saddr);
+        packet.ip_header.daddr = ntohl(packet.ip_header.daddr);
+        packet.ip_header.check = ntohs(packet.ip_header.check);
+        char checksum = packet.ip_header.check == CHECKSUM_VALID ? 'P' : 'F';
+
+        // Convert ips to dotted-quad notation
+        uint8_t squads[4];
+        to_quad(packet.ip_header.saddr, squads);
+        uint8_t dquads[4];
+        to_quad(packet.ip_header.daddr, dquads);
+
+        printf("%u.%06u %u.%u.%u.%u %u.%u.%u.%u %c %u\n", 
+                packet.timestamp.tv_sec, packet.timestamp.tv_usec, 
+                squads[0], squads[1], squads[2], squads[3], 
+                dquads[0], dquads[1], dquads[2], dquads[3], 
+                checksum, 
+                packet.ip_header.ttl
+            );
+    }
+    fclose(file);
 }
 
 void printForwardingTable(char *fwd_file) {
@@ -86,7 +136,7 @@ void printForwardingTable(char *fwd_file) {
     // • interface: The interface number on which to forward traffic matching the rule’s IP address and prefix.
     // Examples:
     // 10.0.0.0 8 1
-    ForwardingTableEntry entry;
+    fwd_table_entry entry;
     FILE * file = fopen(fwd_file, "rb");
 
     if (file == nullptr) {
@@ -98,13 +148,12 @@ void printForwardingTable(char *fwd_file) {
     while (fread(&entry, FWD_TABLE_ENTRY_SZ, 1, file) == 1) {
         // Turn fields into host byte order first
         uint32_t ip = ntohl(entry.ip);
-        uint8_t quad1 = (ip >> 24) & 0xFF;
-        uint8_t quad2 = (ip >> 16) & 0xFF;
-        uint8_t quad3 = (ip >> 8) & 0xFF;
-        uint8_t quad4 = ip & 0xFF;
         uint16_t prefix_len = ntohs(entry.prefix_len);
         uint16_t interface = ntohs(entry.interface);
-        printf("%u.%u.%u.%u %u %u\n", quad1, quad2, quad3, quad4, prefix_len, interface);
+        // Convert ip to dotted-quad notation
+        uint8_t quads[4];
+        to_quad(ip, quads);
+        printf("%u.%u.%u.%u %u %u\n", quads[0], quads[1], quads[2], quads[3], prefix_len, interface);
     }
     fclose(file);
 }
