@@ -1,10 +1,13 @@
 #include <iostream>
+#include <map>
+#include <set>
+#include <iomanip>
 #include <cstdlib>
 #include <unistd.h>
 #include <cstdint>
 #include <cstdio>
 #include <arpa/inet.h>
-#include "ip.h" // TODO fix path when submitting to class server
+#include <netinet/ip.h>
 
 #define ARG_PACKET_PRINT  0x1
 #define ARG_FWD_TABLE_PRINT   0x2
@@ -14,6 +17,9 @@
 #define FWD_TABLE_ENTRY_SZ 8
 #define PACKET_SZ 28
 #define CHECKSUM_VALID 1234
+#define USE_DEFAULT_INTERFACE 0 
+#define TTL_EXPIRED 0
+#define NULL_ROUTE 0
 
 unsigned short cmd_line_flags = 0;
 char *fwd_file = NULL;
@@ -40,6 +46,10 @@ void to_quad(uint32_t ip, uint8_t* quads) {
     quads[1] = (ip >> 16) & 0xFF;
     quads[2] = (ip >> 8) & 0xFF;
     quads[3] = ip & 0xFF;
+}
+
+uint8_t get_first_8_bits(uint32_t ip) {
+    return (ip >> 24) & 0xFF;
 }
 
 
@@ -127,15 +137,6 @@ void printPacket(char *trace_file) {
 }
 
 void printForwardingTable(char *fwd_file) {
-    // Print rules in forwarding table file in the following format:
-    //          ip prefix_len interface
-    // • ip: This is the IPv4 address from the forwarding table printed in dotted-quad notation. That is, four
-    // unpadded decimal integers separated by periods (“.”). E.g., “192.168.10.54”.
-    // • prefix len: The number of bits the router will use when comparing the IP address prefix in the rule
-    // with the destination IP address in incoming packets.
-    // • interface: The interface number on which to forward traffic matching the rule’s IP address and prefix.
-    // Examples:
-    // 10.0.0.0 8 1
     fwd_table_entry entry;
     FILE * file = fopen(fwd_file, "rb");
 
@@ -158,10 +159,118 @@ void printForwardingTable(char *fwd_file) {
     fclose(file);
 }
 
-void simulation(char *fwd_file, char *trace_file) {
-    std::cout << "Running simulation with forwarding file: " << fwd_file 
-              << " and trace file: " << trace_file << std::endl;
-    // Implementation of simulation goes here
+int filesize(FILE * file) {
+    fseek(file, 0, SEEK_END);
+    int size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    return size;
+}
+
+void simulation(char *fwd_filename, char *trace_filename) {
+    int default_interface = -1;
+
+    // Read files to arrays
+    FILE * fwd_file = fopen(fwd_filename, "rb");
+    FILE * trace_file = fopen(trace_filename, "rb");
+
+    if (fwd_file == nullptr) {
+        fprintf(stderr, "Error: could not open file %s \n", fwd_filename);
+        exit(1);
+    }
+    if (trace_file == nullptr) {
+        fprintf(stderr, "Error: could not open file %s \n", trace_filename);
+        exit(1);
+    }
+
+    int num_tbl_entries = filesize(fwd_file) / FWD_TABLE_ENTRY_SZ;
+    int num_packets = filesize(trace_file) / PACKET_SZ;
+    fwd_table_entry fwd_table[num_tbl_entries];
+    packet packets[num_packets];
+    fread(fwd_table, FWD_TABLE_ENTRY_SZ, num_tbl_entries, fwd_file);
+    fread(packets, PACKET_SZ, num_packets, trace_file);
+    std::set<uint32_t> duplicate_ips;
+    std::map<uint8_t, fwd_table_entry> fwd_table_map; // ip first 8 bits -> fwd_table_entry
+
+    for (int i = 0; i < num_tbl_entries; i++) {
+        fwd_table_entry entry = fwd_table[i];
+        // Convert to host byte order
+        entry.ip = ntohl(entry.ip);
+        entry.prefix_len = ntohs(entry.prefix_len);
+        entry.interface = ntohs(entry.interface);
+
+        // Check for default interface
+        if (entry.ip == USE_DEFAULT_INTERFACE) {
+            default_interface = entry.interface;
+        }
+
+        // Check for duplicates
+        if (duplicate_ips.insert(entry.ip).second == false) {
+            uint8_t quads[4];
+            to_quad(entry.ip, quads);
+            fprintf(stderr, "Error: duplicate ip in fwd_table: %u.%u.%u.%u\n", quads[0], quads[1], quads[2], quads[3]);
+            exit(1);
+        }
+        // Map the first 8 bits of the ip to the fwd_table_entry
+        fwd_table_map[get_first_8_bits(entry.ip)] = entry;
+
+    }
+
+    // Convert packets to host byte order
+    for (int i = 0; i < num_packets; i++) {
+        packets[i].timestamp.tv_sec = ntohl(packets[i].timestamp.tv_sec);
+        packets[i].timestamp.tv_usec = ntohl(packets[i].timestamp.tv_usec);
+        packets[i].ip_header.saddr = ntohl(packets[i].ip_header.saddr);
+        packets[i].ip_header.daddr = ntohl(packets[i].ip_header.daddr);
+        packets[i].ip_header.check = ntohs(packets[i].ip_header.check);
+    }
+
+    // Simulate
+    for (int i = 0; i < num_packets; i++) {
+        packet packet = packets[i];
+        packet.ip_header.ttl--;
+
+        // 325 portion - prefix_len is always 8 
+        // only match the first 8 bits of the destination ip
+        uint8_t first_8_bits = get_first_8_bits(packet.ip_header.daddr);
+        std::map<uint8_t, fwd_table_entry>::iterator match_iterator = fwd_table_map.find(first_8_bits);
+
+        // Format timestamp
+        // TODO: do i need to define 6 as a constant?
+        std::ostringstream oss;
+        oss << packet.timestamp.tv_sec << '.'
+            << std::setw(6) << std::setfill('0') << packet.timestamp.tv_usec;
+        std::string timestamp = oss.str();    
+        
+        // Process packet
+        if (packet.ip_header.check != CHECKSUM_VALID) {
+            std::cout << timestamp << " drop checksum" << std::endl;
+            continue;
+        }
+        if (packet.ip_header.ttl == TTL_EXPIRED) {
+            std::cout << timestamp << " drop expired" << std::endl;
+            continue;
+        }
+        if (match_iterator != fwd_table_map.end() && match_iterator->second.interface == NULL_ROUTE) {
+            std::cout << timestamp << " drop policy" << std::endl;
+            continue;
+        }
+        if (match_iterator != fwd_table_map.end()) {
+            std::string action = "send " + std::to_string(match_iterator->second.interface);
+            std::cout << timestamp << " " << action << std::endl;
+            continue;
+        }
+        // if not falling into any above rule AND default interface exists, send to default interface
+        if (default_interface != -1) {
+            std::string action = "default " + std::to_string(default_interface);
+            std::cout << timestamp << " " << action << std::endl;
+            continue;
+        }
+        // if not falling into any above rule, drop unknown
+        std::cout << timestamp << " drop unknown" << std::endl;
+        continue;
+    }
+    fclose(fwd_file);
+    fclose(trace_file);
 }
 
 int main (int argc, char *argv [])
