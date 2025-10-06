@@ -297,6 +297,7 @@ void simulation(char *fwd_filename, char *trace_filename) {
     }
     fclose(fwd_file);
     fclose(trace_file);
+    free(packets);
 }
 
 int main (int argc, char *argv [])
