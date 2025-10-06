@@ -1,3 +1,18 @@
+/* Name: Thao Nguyen 
+ Case Network ID: ttn60
+ The filename: proj2.cc
+ Date created: Sep 18, 2025
+ Description: This program simulate how a router process packets coming through it. It takes 1 or 2 inputs depending on the mode, the packet trace file that contains IP header and the forwarding table file that contains rules to process the packets.
+
+ There are 3 modes: 
+ -p: print the packet trace file in the format:
+	timestamp src_addr dst_addr checksum ttl
+ -r: print the forwarding table in the format:
+ 	ip prefix_len interface
+ -s: takes both a trace file and a forwarding table, and prints out the actions that the router take for each packet.
+
+ It is submitted as Assignment 2 in the course CSDS 325: Computer Networks.
+*/
 #include <iostream>
 #include <map>
 #include <set>
