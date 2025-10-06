@@ -25,21 +25,21 @@ unsigned short cmd_line_flags = 0;
 char *fwd_file = NULL;
 char *trace_file = NULL;
 
-struct fwd_table_entry {
+typedef struct {
     uint32_t ip;
     uint16_t prefix_len;
     uint16_t interface;
-};
+} fwd_table_entry;
 
-struct timev {
+typedef struct {
     uint32_t tv_sec;
     uint32_t tv_usec;
-};
+} timev;
 
-struct packet {
+typedef struct {
     timev timestamp;
     iphdr ip_header;
-};
+} packet;
 
 void to_quad(uint32_t ip, uint8_t* quads) {
     quads[0] = (ip >> 24) & 0xFF;
@@ -146,6 +146,7 @@ void printForwardingTable(char *fwd_file) {
     }
 
     // Read each entry in the forwarding table file
+    // TODO refactor to reuse this code for simulation and print
     while (fread(&entry, FWD_TABLE_ENTRY_SZ, 1, file) == 1) {
         // Turn fields into host byte order first
         uint32_t ip = ntohl(entry.ip);
@@ -182,12 +183,23 @@ void simulation(char *fwd_filename, char *trace_filename) {
         exit(1);
     }
 
+    // TODO segfault stack overflow: currently reserve unnecessary memory on stack
+    // Don't hold this memory all at once, just process each packet one at a time
+    // store fwd table, not packets
+
+    // band-aid solution
+    packet *packets = (packet*) malloc(filesize(trace_file));
+    
     int num_tbl_entries = filesize(fwd_file) / FWD_TABLE_ENTRY_SZ;
     int num_packets = filesize(trace_file) / PACKET_SZ;
     fwd_table_entry fwd_table[num_tbl_entries];
-    packet packets[num_packets];
-    fread(fwd_table, FWD_TABLE_ENTRY_SZ, num_tbl_entries, fwd_file);
-    fread(packets, PACKET_SZ, num_packets, trace_file);
+
+    if (fread(fwd_table, FWD_TABLE_ENTRY_SZ, num_tbl_entries, fwd_file) != (size_t) num_tbl_entries) {
+        fprintf(stderr, "Error: reading file unsuccessful");
+    }
+    if(fread(packets, PACKET_SZ, num_packets, trace_file) != (size_t) num_packets){
+        fprintf(stderr, "Error: reading file unsuccessful");
+    }
     std::set<uint32_t> duplicate_ips;
     std::map<uint8_t, fwd_table_entry> fwd_table_map; // ip first 8 bits -> fwd_table_entry
 
@@ -235,7 +247,6 @@ void simulation(char *fwd_filename, char *trace_filename) {
         std::map<uint8_t, fwd_table_entry>::iterator match_iterator = fwd_table_map.find(first_8_bits);
 
         // Format timestamp
-        // TODO: do i need to define 6 as a constant?
         std::ostringstream oss;
         oss << packet.timestamp.tv_sec << '.'
             << std::setw(6) << std::setfill('0') << packet.timestamp.tv_usec;
