@@ -118,6 +118,7 @@ void parseargs (int argc, char *argv [])
 }
 
 void printPacket(char *trace_file) {
+    // TODO refactor to reuse code for print and sim mode
     packet packet;
     FILE * file = fopen(trace_file, "rb");
 
@@ -197,24 +198,14 @@ void simulation(char *fwd_filename, char *trace_filename) {
         fprintf(stderr, "Error: could not open file %s \n", trace_filename);
         exit(1);
     }
-
-    // TODO segfault stack overflow: currently reserve unnecessary memory on stack
-    // Don't hold this memory all at once, just process each packet one at a time
-    // store fwd table, not packets
-
-    // band-aid solution
-    packet *packets = (packet*) malloc(filesize(trace_file));
     
     int num_tbl_entries = filesize(fwd_file) / FWD_TABLE_ENTRY_SZ;
-    int num_packets = filesize(trace_file) / PACKET_SZ;
     fwd_table_entry fwd_table[num_tbl_entries];
 
     if (fread(fwd_table, FWD_TABLE_ENTRY_SZ, num_tbl_entries, fwd_file) != (size_t) num_tbl_entries) {
         fprintf(stderr, "Error: reading file unsuccessful");
     }
-    if(fread(packets, PACKET_SZ, num_packets, trace_file) != (size_t) num_packets){
-        fprintf(stderr, "Error: reading file unsuccessful");
-    }
+
     std::set<uint32_t> duplicate_ips;
     std::map<uint8_t, fwd_table_entry> fwd_table_map; // ip first 8 bits -> fwd_table_entry
 
@@ -242,18 +233,15 @@ void simulation(char *fwd_filename, char *trace_filename) {
 
     }
 
-    // Convert packets to host byte order
-    for (int i = 0; i < num_packets; i++) {
-        packets[i].timestamp.tv_sec = ntohl(packets[i].timestamp.tv_sec);
-        packets[i].timestamp.tv_usec = ntohl(packets[i].timestamp.tv_usec);
-        packets[i].ip_header.saddr = ntohl(packets[i].ip_header.saddr);
-        packets[i].ip_header.daddr = ntohl(packets[i].ip_header.daddr);
-        packets[i].ip_header.check = ntohs(packets[i].ip_header.check);
-    }
-
-    // Simulate
-    for (int i = 0; i < num_packets; i++) {
-        packet packet = packets[i];
+    // Read and process each packet from the file
+    packet packet;
+    while (fread(&packet, PACKET_SZ, 1, trace_file) == 1){
+        packet.timestamp.tv_sec = ntohl(packet.timestamp.tv_sec);
+        packet.timestamp.tv_usec = ntohl(packet.timestamp.tv_usec);
+        packet.ip_header.saddr = ntohl(packet.ip_header.saddr);
+        packet.ip_header.daddr = ntohl(packet.ip_header.daddr);
+        packet.ip_header.check = ntohs(packet.ip_header.check);
+    
         packet.ip_header.ttl--;
 
         // 325 portion - prefix_len is always 8 
@@ -285,19 +273,18 @@ void simulation(char *fwd_filename, char *trace_filename) {
             std::cout << timestamp << " " << action << std::endl;
             continue;
         }
-        // if not falling into any above rule AND default interface exists, send to default interface
+        // If not falling into any above rule AND default interface exists, send to default interface
         if (default_interface != -1) {
             std::string action = "default " + std::to_string(default_interface);
             std::cout << timestamp << " " << action << std::endl;
             continue;
         }
-        // if not falling into any above rule, drop unknown
+        // If not falling into any above rule, drop unknown
         std::cout << timestamp << " drop unknown" << std::endl;
         continue;
     }
     fclose(fwd_file);
     fclose(trace_file);
-    free(packets);
 }
 
 int main (int argc, char *argv [])
