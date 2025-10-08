@@ -67,7 +67,6 @@ uint8_t get_first_8_bits(uint32_t ip) {
     return (ip >> 24) & 0xFF;
 }
 
-
 void usage (char *progname)
 {
     fprintf (stderr,"--------------- USAGE: ---------------\n");
@@ -117,8 +116,21 @@ void parseargs (int argc, char *argv [])
     }
 }
 
-void printPacket(char *trace_file) {
-    // TODO refactor to reuse code for print and sim mode
+// Helper function, read info from trace file to a packet struct file
+bool read_packet (FILE* file, packet* packet) {
+    if (fread(packet, PACKET_SZ, 1, file) != 1) {
+        return false;
+    }
+    // Convert to host byte order
+    packet->timestamp.tv_sec = ntohl(packet->timestamp.tv_sec);
+    packet->timestamp.tv_usec = ntohl(packet->timestamp.tv_usec);
+    packet->ip_header.saddr = ntohl(packet->ip_header.saddr);
+    packet->ip_header.daddr = ntohl(packet->ip_header.daddr);
+    packet->ip_header.check = ntohs(packet->ip_header.check);
+    return true;
+}
+
+void print_packet(char *trace_file) {
     packet packet;
     FILE * file = fopen(trace_file, "rb");
 
@@ -126,13 +138,8 @@ void printPacket(char *trace_file) {
         fprintf(stderr, "Error: could not open file %s \n", trace_file);
         exit(1);
     }
-    while (fread(&packet, PACKET_SZ, 1, file) == 1) {
-        // Convert to host byte order
-        packet.timestamp.tv_sec = ntohl(packet.timestamp.tv_sec);
-        packet.timestamp.tv_usec = ntohl(packet.timestamp.tv_usec);
-        packet.ip_header.saddr = ntohl(packet.ip_header.saddr);
-        packet.ip_header.daddr = ntohl(packet.ip_header.daddr);
-        packet.ip_header.check = ntohs(packet.ip_header.check);
+    while (read_packet(file, &packet)) {
+        // Print P or F depending on whether checksum is valid
         char checksum = packet.ip_header.check == CHECKSUM_VALID ? 'P' : 'F';
 
         // Convert ips to dotted-quad notation
@@ -152,7 +159,19 @@ void printPacket(char *trace_file) {
     fclose(file);
 }
 
-void printForwardingTable(char *fwd_file) {
+// Helper function, read info from table file to a table entry struct file
+bool read_fwd_table_entry(FILE* file, fwd_table_entry* entry) {
+    if (fread(entry, FWD_TABLE_ENTRY_SZ, 1, file) != 1) {
+        return false;
+    }
+    // Convert to host byte order
+    entry->ip = ntohl(entry->ip);
+    entry->prefix_len = ntohs(entry->prefix_len);
+    entry->interface = ntohs(entry->interface);
+    return true;
+}
+
+void print_forwarding_table(char *fwd_file) {
     fwd_table_entry entry;
     FILE * file = fopen(fwd_file, "rb");
 
@@ -162,34 +181,23 @@ void printForwardingTable(char *fwd_file) {
     }
 
     // Read each entry in the forwarding table file
-    // TODO refactor to reuse this code for simulation and print
-    while (fread(&entry, FWD_TABLE_ENTRY_SZ, 1, file) == 1) {
-        // Turn fields into host byte order first
-        uint32_t ip = ntohl(entry.ip);
-        uint16_t prefix_len = ntohs(entry.prefix_len);
-        uint16_t interface = ntohs(entry.interface);
+    while (read_fwd_table_entry(file, &entry)) {
         // Convert ip to dotted-quad notation
         uint8_t quads[4];
-        to_quad(ip, quads);
-        printf("%u.%u.%u.%u %u %u\n", quads[0], quads[1], quads[2], quads[3], prefix_len, interface);
+        to_quad(entry.ip, quads);
+        printf("%u.%u.%u.%u %u %u\n", quads[0], quads[1], quads[2], quads[3], entry.prefix_len, entry.interface);
     }
     fclose(file);
 }
 
-int filesize(FILE * file) {
-    fseek(file, 0, SEEK_END);
-    int size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    return size;
-}
-
 void simulation(char *fwd_filename, char *trace_filename) {
     int default_interface = -1;
+    std::map<uint8_t, fwd_table_entry> fwd_table_map;
+    fwd_table_entry entry;
+    packet packet;
 
-    // Read files to arrays
     FILE * fwd_file = fopen(fwd_filename, "rb");
     FILE * trace_file = fopen(trace_filename, "rb");
-
     if (fwd_file == nullptr) {
         fprintf(stderr, "Error: could not open file %s \n", fwd_filename);
         exit(1);
@@ -198,54 +206,33 @@ void simulation(char *fwd_filename, char *trace_filename) {
         fprintf(stderr, "Error: could not open file %s \n", trace_filename);
         exit(1);
     }
-    
-    int num_tbl_entries = filesize(fwd_file) / FWD_TABLE_ENTRY_SZ;
-    fwd_table_entry fwd_table[num_tbl_entries];
 
-    if (fread(fwd_table, FWD_TABLE_ENTRY_SZ, num_tbl_entries, fwd_file) != (size_t) num_tbl_entries) {
-        fprintf(stderr, "Error: reading file unsuccessful");
-    }
-
-    std::set<uint32_t> duplicate_ips;
-    std::map<uint8_t, fwd_table_entry> fwd_table_map; // ip first 8 bits -> fwd_table_entry
-
-    for (int i = 0; i < num_tbl_entries; i++) {
-        fwd_table_entry entry = fwd_table[i];
-        // Convert to host byte order
-        entry.ip = ntohl(entry.ip);
-        entry.prefix_len = ntohs(entry.prefix_len);
-        entry.interface = ntohs(entry.interface);
-
+    while (read_fwd_table_entry(fwd_file, &entry)) {
         // Check for default interface
         if (entry.ip == USE_DEFAULT_INTERFACE) {
             default_interface = entry.interface;
         }
 
+        // 325 portion, prefix_len always = 8
+        uint8_t first8bits = get_first_8_bits(entry.ip);
+
         // Check for duplicates
-        if (duplicate_ips.insert(entry.ip).second == false) {
+        if (fwd_table_map.find(first8bits) != fwd_table_map.end()) {
             uint8_t quads[4];
             to_quad(entry.ip, quads);
-            fprintf(stderr, "Error: duplicate ip in fwd_table: %u.%u.%u.%u\n", quads[0], quads[1], quads[2], quads[3]);
+            fprintf(stderr, "Error: duplicate ip in the forwarding table: %u.%u.%u.%u\n", quads[0], quads[1], quads[2], quads[3]);
             exit(1);
         }
-        // Map the first 8 bits of the ip to the fwd_table_entry
-        fwd_table_map[get_first_8_bits(entry.ip)] = entry;
 
+        // Map the first 8 bits of the ip to the fwd_table_entry
+        fwd_table_map[first8bits] = entry;
     }
 
     // Read and process each packet from the file
-    packet packet;
-    while (fread(&packet, PACKET_SZ, 1, trace_file) == 1){
-        packet.timestamp.tv_sec = ntohl(packet.timestamp.tv_sec);
-        packet.timestamp.tv_usec = ntohl(packet.timestamp.tv_usec);
-        packet.ip_header.saddr = ntohl(packet.ip_header.saddr);
-        packet.ip_header.daddr = ntohl(packet.ip_header.daddr);
-        packet.ip_header.check = ntohs(packet.ip_header.check);
-    
+    while (read_packet(trace_file, &packet)){
+        // Router automatically decrement ttl when see packet
         packet.ip_header.ttl--;
 
-        // 325 portion - prefix_len is always 8 
-        // only match the first 8 bits of the destination ip
         uint8_t first_8_bits = get_first_8_bits(packet.ip_header.daddr);
         std::map<uint8_t, fwd_table_entry>::iterator match_iterator = fwd_table_map.find(first_8_bits);
 
@@ -296,14 +283,14 @@ int main (int argc, char *argv [])
             fprintf (stderr,"error: -p requires -t trace_file\n");
             usage (argv [0]);
         }
-        printPacket(trace_file);
+        print_packet(trace_file);
     }
     else if (cmd_line_flags & ARG_FWD_TABLE_PRINT) {
         if (!(cmd_line_flags & ARG_FWD_FILE)) {
             fprintf (stderr,"error: -r requires -f forward_file\n");
             usage (argv [0]);
         }
-        printForwardingTable(fwd_file);
+        print_forwarding_table(fwd_file);
     }
     else if (cmd_line_flags & ARG_SIMULATION) {
         if (!(cmd_line_flags & ARG_FWD_FILE) && !(cmd_line_flags & ARG_TRACE_FILE)) {

@@ -3,3 +3,5 @@ ip.h
 *.o
 proj2
 .vscode
+p2-test
+my-output*
